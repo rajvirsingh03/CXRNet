@@ -1,0 +1,640 @@
+import os
+import argparse
+import hashlib
+import json
+import random
+import pandas as pd
+from PIL import Image
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from sklearn.model_selection import train_test_split
+import torchvision.transforms as transforms
+from tqdm.auto import tqdm
+import wandb
+from sklearn.metrics import precision_recall_curve, roc_auc_score, f1_score
+import numpy as np
+from torchvision.models import densenet121, DenseNet121_Weights
+
+# Configuration settings
+CONFIG = {
+    "model": "chexnet_14_pathology_reproduction",
+    "batch_size": 16,
+    "learning_rate": 0.001,
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.999,
+    "epochs": 20,
+    "num_workers": 8,
+    "device": "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu",
+    "data_dir": None,
+    "wandb_project": "X-Ray Classification",
+    "wandb_mode": "offline",
+    "patience": 5,
+    "seed": 42,
+    "image_size": 224,  # Consistent image size
+    "output_dir": "models",
+    "train_fraction": 0.70,
+    "val_fraction": 0.10,
+    "test_fraction": 0.20,
+    "max_train_batches": None,
+    "max_eval_batches": None,
+    "weights": "imagenet",
+}
+
+def discover_data_dir():
+    candidates = [
+        os.environ.get("NIH_DATA_DIR"),
+        "/kaggle/input/data",
+        "/kaggle/input/nih-chest-xrays/data",
+        "/kaggle/input/nih-chest-xrays",
+    ]
+    for candidate in candidates:
+        if candidate and os.path.exists(os.path.join(candidate, "Data_Entry_2017.csv")):
+            return candidate
+    kaggle_input = "/kaggle/input"
+    if os.path.isdir(kaggle_input):
+        for root, dirs, files in os.walk(kaggle_input):
+            if "Data_Entry_2017.csv" in files and any(d.startswith("images_") for d in dirs):
+                return root
+    return None
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train the CheXNet reproduction on NIH ChestX-ray14")
+    parser.add_argument(
+        "--data_dir",
+        default=discover_data_dir(),
+        help="Path to NIH ChestX-ray14 containing Data_Entry_2017.csv and images_001 ... images_012/images",
+    )
+    parser.add_argument("--epochs", type=int, default=CONFIG["epochs"], help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=CONFIG["batch_size"], help="Batch size")
+    parser.add_argument("--num_workers", type=int, default=CONFIG["num_workers"], help="DataLoader workers")
+    parser.add_argument("--output_dir", default=CONFIG["output_dir"], help="Directory for checkpoints and results")
+    parser.add_argument(
+        "--max_train_batches",
+        type=int,
+        default=None,
+        help="Optional batch limit for a smoke test; omit for full training",
+    )
+    parser.add_argument(
+        "--max_eval_batches",
+        type=int,
+        default=None,
+        help="Optional validation/test batch limit for a smoke test; omit for full evaluation",
+    )
+    parser.add_argument(
+        "--weights",
+        choices=["imagenet", "none"],
+        default=CONFIG["weights"],
+        help="Use ImageNet initialization for full reproduction; 'none' is for offline smoke tests",
+    )
+    parser.add_argument(
+        "--wandb_mode",
+        default=CONFIG["wandb_mode"],
+        choices=["online", "offline", "disabled"],
+        help="Weights & Biases logging mode",
+    )
+    parser.add_argument(
+        "--evaluate_only",
+        action="store_true",
+        help="Load an existing checkpoint and evaluate fixed and validation-tuned F1 thresholds",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        help="Path to best_model.pth; required with --evaluate_only",
+    )
+    return parser.parse_args()
+
+args = parse_args()
+if not args.data_dir:
+    raise ValueError("Provide --data_dir or set NIH_DATA_DIR to the NIH ChestX-ray14 directory.")
+if args.evaluate_only and not args.checkpoint:
+    raise ValueError("Provide --checkpoint when using --evaluate_only.")
+if args.checkpoint and not os.path.isfile(args.checkpoint):
+    raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
+
+CONFIG.update({
+    "data_dir": args.data_dir,
+    "epochs": args.epochs,
+    "batch_size": args.batch_size,
+    "num_workers": args.num_workers,
+    "output_dir": args.output_dir,
+    "wandb_mode": args.wandb_mode,
+    "max_train_batches": args.max_train_batches,
+    "max_eval_batches": args.max_eval_batches,
+    "weights": args.weights,
+})
+
+random.seed(CONFIG["seed"])
+np.random.seed(CONFIG["seed"])
+torch.manual_seed(CONFIG["seed"])
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(CONFIG["seed"])
+
+transform_train = transforms.Compose([
+    transforms.Resize(224),                   # downscale to 224×224 as stated
+    transforms.RandomHorizontalFlip(),        # only augmentation they mention
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406],
+                         [0.229, 0.224, 0.225])
+])
+
+
+transform_test = transforms.Compose([
+    transforms.Resize(224),                   # just resize, no center crop
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406],
+                         [0.229, 0.224, 0.225])
+])
+
+
+
+# Load the CSV file with image metadata
+data_path = os.path.abspath(CONFIG["data_dir"])
+if not os.path.isdir(data_path):
+    raise FileNotFoundError(f"Data directory not found: {data_path}")
+csv_file = os.path.join(data_path, "Data_Entry_2017.csv")
+if not os.path.exists(csv_file):
+    raise FileNotFoundError(f"Metadata file not found: {csv_file}")
+print(f"Using dataset directory: {data_path}")
+df = pd.read_csv(csv_file)
+
+# Get list of all image folders from images_001 to images_012
+image_folders = [os.path.join(data_path, f"images_{str(i).zfill(3)}", "images") for i in range(1, 13)]
+
+# Create a dictionary mapping image filenames to their folder paths
+image_to_folder = {}
+for folder in image_folders:
+    if os.path.exists(folder):
+        for img_file in os.listdir(folder):
+            if img_file.endswith('.png'):
+                image_to_folder[img_file] = folder
+
+# Filter the CSV to include only images that are present in the folders
+df = df[df['Image Index'].isin(image_to_folder.keys())]
+df = df[df['View Position'].isin(['PA', 'AP'])]
+if df.empty:
+    raise ValueError("No matching PNG images found. Expected images_001 ... images_012/images folders.")
+
+# Reproduce the 70%/10%/20% patient-level split described for the
+# 14-pathology CheXNet experiment. Sorting makes the seeded split reproducible.
+unique_patients = np.sort(df['Patient ID'].unique())
+train_val_patients, test_patients = train_test_split(
+    unique_patients,
+    test_size=CONFIG["test_fraction"],
+    random_state=CONFIG["seed"],
+)
+
+train_patients, val_patients = train_test_split(
+    train_val_patients,
+    test_size=CONFIG["val_fraction"] / (1.0 - CONFIG["test_fraction"]),
+    random_state=CONFIG["seed"],
+)
+
+#Use those patients to filter full image rows
+train_df = df[df['Patient ID'].isin(train_patients)]
+val_df   = df[df['Patient ID'].isin(val_patients)]
+test_df  = df[df['Patient ID'].isin(test_patients)]
+
+print(
+    "Patient split: "
+    f"train={len(train_patients)}, val={len(val_patients)}, test={len(test_patients)}"
+)
+print(
+    "Image split: "
+    f"train={len(train_df)}, val={len(val_df)}, test={len(test_df)}"
+)
+
+
+# List of diseases we’re classifying
+disease_list = [
+    'Atelectasis', 'Cardiomegaly', 'Consolidation', 'Edema', 'Effusion',
+    'Emphysema', 'Fibrosis', 'Hernia', 'Infiltration', 'Mass',
+    'Nodule', 'Pleural_Thickening', 'Pneumonia', 'Pneumothorax'
+]
+
+# Function to convert label string to a vector
+def get_label_vector(labels_str):
+    labels = labels_str.split('|')
+
+    if labels == ['No Finding']:
+        return [0] * len(disease_list)
+    
+    else:
+        return [1 if disease in labels else 0 for disease in disease_list]
+ 
+# Custom Dataset class
+class CheXNetDataset(Dataset):
+    def __init__(self, dataframe, image_to_folder, transform=None):
+        self.dataframe = dataframe
+        self.image_to_folder = image_to_folder
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.dataframe)
+
+    def __getitem__(self, idx):
+        img_name = self.dataframe.iloc[idx]['Image Index']
+        folder = self.image_to_folder[img_name]
+
+        img_path = os.path.join(folder, img_name)
+        image = Image.open(img_path).convert('RGB')
+
+        if self.transform:
+            image = self.transform(image)
+
+        labels_str = self.dataframe.iloc[idx]['Finding Labels']
+        label_vector = get_label_vector(labels_str)
+        labels = torch.tensor(label_vector, dtype=torch.float)
+
+        return image, labels
+
+# Set up DataLoaders with our custom datasets
+train_dataset = CheXNetDataset(train_df, image_to_folder, transform=transform_train)
+val_dataset = CheXNetDataset(val_df, image_to_folder, transform=transform_test)
+test_dataset = CheXNetDataset(test_df, image_to_folder, transform=transform_test)
+
+trainloader = DataLoader(train_dataset, batch_size=CONFIG["batch_size"], shuffle=True, num_workers=CONFIG["num_workers"])
+valloader = DataLoader(val_dataset, batch_size=CONFIG["batch_size"], shuffle=False, num_workers=CONFIG["num_workers"])
+testloader = DataLoader(test_dataset, batch_size=CONFIG["batch_size"], shuffle=False, num_workers=CONFIG["num_workers"])
+
+# Evaluation function
+def get_optimal_thresholds(labels, predictions):
+    """Select one F1-maximizing threshold per class from validation data."""
+    thresholds = []
+    for class_index in range(predictions.shape[1]):
+        precision, recall, candidates = precision_recall_curve(
+            labels[:, class_index], predictions[:, class_index]
+        )
+        if len(candidates) == 0:
+            thresholds.append(0.5)
+            continue
+        f1_scores = 2 * precision[:-1] * recall[:-1] / (
+            precision[:-1] + recall[:-1] + 1e-8
+        )
+        thresholds.append(float(candidates[int(np.argmax(f1_scores))]))
+    return thresholds
+
+
+def calculate_f1(labels, predictions, thresholds):
+    thresholds = np.asarray(thresholds, dtype=float).reshape(1, -1)
+    # precision_recall_curve defines each candidate using score >= threshold.
+    binary_predictions = (predictions >= thresholds).astype(int)
+    scores = [
+        f1_score(labels[:, i], binary_predictions[:, i], zero_division=0)
+        for i in range(len(disease_list))
+    ]
+    return float(np.mean(scores)), dict(zip(disease_list, scores))
+
+
+def evaluate(
+    model,
+    testloader,
+    criterion,
+    device,
+    desc="[Test]",
+    max_batches=None,
+    return_outputs=False,
+):
+    model.eval()
+    running_loss = 0.0
+    batches_processed = 0
+
+    all_labels = []
+    all_preds = []
+
+    with torch.no_grad():
+        progress_bar = tqdm(testloader, desc=desc, leave=True)
+
+        for batch_index, (inputs, labels) in enumerate(progress_bar):
+            if max_batches is not None and batch_index >= max_batches:
+                break
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            running_loss += loss.item()
+            batches_processed += 1
+            preds = torch.sigmoid(outputs)
+
+            all_labels.append(labels.cpu())
+            all_preds.append(preds.cpu())
+
+    if not all_labels:
+        raise ValueError(f"{desc} loader produced no batches")
+
+    all_labels = torch.cat(all_labels).numpy()
+    all_preds = torch.cat(all_preds).numpy()
+    test_loss = running_loss / batches_processed
+
+    # Compute AUC for each class
+    auc_scores = [
+        roc_auc_score(all_labels[:, i], all_preds[:, i])
+        if len(np.unique(all_labels[:, i])) > 1 else float("nan")
+        for i in range(len(disease_list))
+    ]
+    avg_auc = np.nanmean(auc_scores)
+
+    for i, disease in enumerate(disease_list):
+        print(f"{desc} {disease} AUC-ROC: {auc_scores[i]:.4f}")
+
+    auc_dict = {disease_list[i]: auc_scores[i] for i in range(len(disease_list))}
+
+    # Compute binary predictions for all classes
+    avg_f1, f1_dict = calculate_f1(
+        all_labels,
+        all_preds,
+        thresholds=[0.5] * len(disease_list),
+    )
+
+    # Print per-class F1
+    for i, disease in enumerate(disease_list):
+        print(f"{desc} {disease} F1 Score: {f1_dict[disease]:.4f}")
+    print(f"{desc} Loss: {test_loss:.4f}, Avg AUC-ROC: {avg_auc:.4f}, Avg F1 Score: {avg_f1:.4f}")
+
+    if return_outputs:
+        return test_loss, avg_auc, avg_f1, auc_dict, f1_dict, all_labels, all_preds
+    return test_loss, avg_auc, avg_f1, auc_dict, f1_dict
+
+# Load and modify the model. Full reproduction uses ImageNet initialization.
+initial_weights = (
+    DenseNet121_Weights.IMAGENET1K_V1
+    if CONFIG["weights"] == "imagenet" and not args.evaluate_only
+    else None
+)
+model = densenet121(weights=initial_weights)
+model.classifier = nn.Linear(model.classifier.in_features, 14)
+model = model.to(CONFIG["device"])
+
+# Define loss function and optimizer
+class SummedBinaryCrossEntropy(nn.Module):
+    """Sum unweighted BCE over labels, then average over the batch."""
+
+    def forward(self, logits, targets):
+        per_label_loss = nn.functional.binary_cross_entropy_with_logits(
+            logits,
+            targets,
+            reduction="none",
+        )
+        return per_label_loss.sum(dim=1).mean()
+
+
+criterion = SummedBinaryCrossEntropy()
+
+
+if args.evaluate_only:
+    checkpoint_path = os.path.abspath(args.checkpoint)
+    checkpoint_sha256 = hashlib.sha256()
+    with open(checkpoint_path, "rb") as checkpoint_file:
+        for chunk in iter(lambda: checkpoint_file.read(1024 * 1024), b""):
+            checkpoint_sha256.update(chunk)
+    model.load_state_dict(torch.load(checkpoint_path, map_location=CONFIG["device"]))
+
+    (
+        val_loss,
+        val_auc,
+        val_f1_fixed,
+        val_auc_dict,
+        val_f1_fixed_dict,
+        val_labels,
+        val_predictions,
+    ) = evaluate(
+        model,
+        valloader,
+        criterion,
+        CONFIG["device"],
+        desc="[Validate]",
+        max_batches=CONFIG["max_eval_batches"],
+        return_outputs=True,
+    )
+    thresholds = get_optimal_thresholds(val_labels, val_predictions)
+
+    (
+        test_loss,
+        test_auc,
+        test_f1_fixed,
+        test_auc_dict,
+        test_f1_fixed_dict,
+        test_labels,
+        test_predictions,
+    ) = evaluate(
+        model,
+        testloader,
+        criterion,
+        CONFIG["device"],
+        desc="[Test]",
+        max_batches=CONFIG["max_eval_batches"],
+        return_outputs=True,
+    )
+    test_f1_tuned, test_f1_tuned_dict = calculate_f1(
+        test_labels,
+        test_predictions,
+        thresholds,
+    )
+
+    threshold_dict = dict(zip(disease_list, thresholds))
+    print("\nValidation-selected thresholds and held-out test F1:")
+    for disease in disease_list:
+        print(
+            f"{disease}: threshold={threshold_dict[disease]:.6f}, "
+            f"test F1={test_f1_tuned_dict[disease]:.4f}"
+        )
+    print(f"Test macro F1 at fixed 0.5: {test_f1_fixed:.4f}")
+    print(f"Test macro F1 with validation thresholds: {test_f1_tuned:.4f}")
+
+    results = {
+        "model": CONFIG["model"],
+        "evaluation": "validation-selected per-class F1 thresholds",
+        "checkpoint": os.path.basename(checkpoint_path),
+        "checkpoint_sha256": checkpoint_sha256.hexdigest(),
+        "validation_loss": val_loss,
+        "validation_auc": val_auc,
+        "validation_f1_fixed_0_5": val_f1_fixed,
+        "validation_auc_dict": val_auc_dict,
+        "validation_f1_fixed_0_5_dict": val_f1_fixed_dict,
+        "validation_thresholds": threshold_dict,
+        "test_loss": test_loss,
+        "test_auc": test_auc,
+        "test_auc_dict": test_auc_dict,
+        "test_f1_fixed_0_5": test_f1_fixed,
+        "test_f1_fixed_0_5_dict": test_f1_fixed_dict,
+        "test_f1_validation_thresholds": test_f1_tuned,
+        "test_f1_validation_thresholds_dict": test_f1_tuned_dict,
+        "patient_counts": {
+            "train": len(train_patients),
+            "validation": len(val_patients),
+            "test": len(test_patients),
+        },
+        "image_counts": {
+            "train": len(train_df),
+            "validation": len(val_df),
+            "test": len(test_df),
+        },
+        "config": CONFIG,
+        "note": (
+            "Thresholds were selected only on the validation set and applied "
+            "unchanged to the held-out test set. This is a secondary analysis, "
+            "not a reproduction of the unavailable expert-labeled F1 evaluation."
+        ),
+    }
+    os.makedirs(CONFIG["output_dir"], exist_ok=True)
+    results_path = os.path.join(CONFIG["output_dir"], "thresholded_f1_results.json")
+    with open(results_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, default=float)
+    print(f"Saved threshold evaluation to: {results_path}")
+    raise SystemExit(0)
+
+
+optimizer = optim.Adam(
+    model.parameters(),
+    lr=CONFIG["learning_rate"],
+    betas=(CONFIG["adam_beta1"], CONFIG["adam_beta2"]),
+)
+
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode="min",
+    patience=0,
+    factor=0.1,
+)
+
+
+
+# Training function
+def train(epoch, model, trainloader, optimizer, criterion, CONFIG):
+    device = CONFIG["device"]
+    model.train()
+
+    running_loss = 0.0
+    progress_bar = tqdm(trainloader, desc=f"Epoch {epoch+1}/{CONFIG['epochs']} [Train]", leave=True)
+
+    batches_processed = 0
+    for i, (inputs, labels) in enumerate(progress_bar):
+        if CONFIG["max_train_batches"] is not None and i >= CONFIG["max_train_batches"]:
+            break
+        inputs, labels = inputs.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+        batches_processed += 1
+        progress_bar.set_postfix({"loss": running_loss / (i + 1)})
+
+    if batches_processed == 0:
+        raise ValueError("Training loader produced no batches")
+    train_loss = running_loss / batches_processed
+    return train_loss
+
+def validate(model, valloader, criterion, device):
+    val_loss, val_auc, val_f1, auc_dict, f1_dict = evaluate(
+        model,
+        valloader,
+        criterion,
+        device,
+        desc="[Validate]",
+        max_batches=CONFIG["max_eval_batches"],
+    )
+    return val_loss, val_auc, val_f1, auc_dict, f1_dict
+
+# Training loop with WandB and a stable best-checkpoint path
+wandb.init(project=CONFIG["wandb_project"], config=CONFIG, mode=CONFIG["wandb_mode"])
+wandb.watch(model, log="all")
+
+run_id = wandb.run.id
+checkpoint_dir = os.path.join(CONFIG["output_dir"], run_id)
+os.makedirs(checkpoint_dir, exist_ok=True)
+
+# Record the exact patient assignment used for this run.
+split_rows = []
+for split_name, patient_ids in (
+    ("train", train_patients),
+    ("validation", val_patients),
+    ("test", test_patients),
+):
+    split_rows.extend({"Patient ID": patient_id, "split": split_name} for patient_id in patient_ids)
+pd.DataFrame(split_rows).sort_values(["split", "Patient ID"]).to_csv(
+    os.path.join(checkpoint_dir, "patient_splits.csv"),
+    index=False,
+)
+
+best_val_loss = float("inf")
+patience_counter = 0
+
+for epoch in range(CONFIG["epochs"]):
+    train_loss = train(epoch, model, trainloader, optimizer, criterion, CONFIG)
+    val_loss, val_auc, val_f1, auc_dict, f1_dict = validate(model, valloader, criterion, CONFIG["device"])
+    scheduler.step(val_loss)
+
+    wandb.log({
+        "epoch": epoch + 1,
+        "train_loss": train_loss,
+        "val_loss": val_loss,
+        "val_auc": val_auc,
+        "val_f1": val_f1,
+        "f1_dict": f1_dict,
+        "auc_dict": auc_dict,
+    })
+
+    # The original CheXNet protocol selects the model with lowest validation loss.
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        patience_counter = 0
+        checkpoint_path = os.path.join(checkpoint_dir, "best_model.pth")
+        torch.save(model.state_dict(), checkpoint_path)
+        wandb.save(checkpoint_path)
+
+    else:
+        patience_counter += 1
+
+        if patience_counter >= CONFIG["patience"]:
+            print("Early stopping triggered.")
+            break
+
+# Evaluate the model with the lowest validation loss.
+best_checkpoint_path = os.path.join(checkpoint_dir, "best_model.pth")
+model.load_state_dict(torch.load(best_checkpoint_path, map_location=CONFIG["device"]))
+test_loss, test_auc, test_f1, auc_dict, f1_dict = evaluate(
+    model,
+    testloader,
+    criterion,
+    CONFIG["device"],
+    max_batches=CONFIG["max_eval_batches"],
+)
+
+results = {
+    "model": CONFIG["model"],
+    "test_loss": test_loss,
+    "test_auc": test_auc,
+    "test_f1": test_f1,
+    "test_auc_dict": auc_dict,
+    "test_f1_dict": f1_dict,
+    "checkpoint": best_checkpoint_path,
+    "patient_splits": os.path.join(checkpoint_dir, "patient_splits.csv"),
+    "patient_counts": {
+        "train": len(train_patients),
+        "validation": len(val_patients),
+        "test": len(test_patients),
+    },
+    "image_counts": {
+        "train": len(train_df),
+        "validation": len(val_df),
+        "test": len(test_df),
+    },
+    "config": CONFIG,
+}
+with open(os.path.join(checkpoint_dir, "test_results.json"), "w", encoding="utf-8") as f:
+    json.dump(results, f, indent=2, default=float)
+
+wandb.log({
+    "test_loss": test_loss,
+    "test_auc": test_auc,
+    "test_f1": test_f1,
+    "test_auc_dict": auc_dict,
+    "test_f1_dict": f1_dict
+})
+
+wandb.finish()
